@@ -1,0 +1,59 @@
+version: '3.9'
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production
+    container_name: node57-app
+    ports:
+      - "${PORT:-3000}:3000"
+    environment:
+      - NODE_ENV=${NODE_ENV:-development}
+      - PORT=3000
+      - APP_NAME=${APP_NAME:-node57}
+      - APP_VERSION=${APP_VERSION:-1.0.0}
+      - DB_HOST=mysql
+      - DB_PORT=3306
+      - DB_NAME=${DB_NAME:-node57_db}
+      - DB_USER=${DB_USER:-node57_user}
+      - DB_PASSWORD=${DB_PASSWORD:-secret}
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+    depends_on:
+      mysql:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - node57-network
+
+  mysql:
+    image: mysql:8.0
+    container_name: node57-mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword
+      MYSQL_DATABASE: ${DB_NAME:-node57_db}
+      MYSQL_USER: ${DB_USER:-node57_user}
+      MYSQL_PASSWORD: ${DB_PASSWORD:-secret}
+    ports:
+      - "${DB_PORT:-3306}:3306"
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "root", "-prootpassword"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    restart: unless-stopped
+    networks:
+      - node57-network
+
+networks:
+  node57-network:
+    driver: bridge
+
+volumes:
+  mysql-data:
+    driver: local

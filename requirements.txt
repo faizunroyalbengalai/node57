@@ -1,0 +1,8 @@
+# Auto-generated starter requirements — replace with your actual dependencies.
+# FastAPI / generic Python web app
+fastapi>=0.110
+uvicorn[standard]
+gunicorn
+python-dotenv
+aiomysql
+sqlalchemy>=2.0

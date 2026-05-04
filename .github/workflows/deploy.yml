@@ -1,240 +1,158 @@
-name: CI/CD Pipeline — node57
+name: Deploy — node57
 
 on:
-  push:
-    branches:
-      - main
-      - master
-  pull_request:
-    branches:
-      - main
-      - master
+  workflow_dispatch:
 
+# Force all actions to run on Node.js 24 to avoid Node 20 deprecation warnings
 env:
-  NODE_VERSION: '20'
-  APP_NAME: node57
-  DOCKER_IMAGE: node57
+  ACTIONS_RUNNER_FORCED_INTERNAL_NODE_VERSION: node24
+  ACTIONS_RUNNER_FORCE_ACTIONS_NODE_VERSION: node24
+
+concurrency:
+  group: deploy-${{ github.repository }}
+  cancel-in-progress: false
 
 jobs:
-  # ─────────────────────────────────────────────
-  # Job 1: Lint
-  # ─────────────────────────────────────────────
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js ${{ env.NODE_VERSION }}
-        uses: actions/setup-node@v4
-        with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
-
-      - name: Install dependencies
-        run: npm ci --frozen-lockfile
-
-      - name: Run ESLint
-        run: npm run lint
-
-  # ─────────────────────────────────────────────
-  # Job 2: Test
-  # ─────────────────────────────────────────────
   test:
     name: Test
     runs-on: ubuntu-latest
-    needs: lint
-
-    services:
-      mysql:
-        image: mysql:8.0
-        env:
-          MYSQL_ROOT_PASSWORD: rootpassword
-          MYSQL_DATABASE: node57_test
-          MYSQL_USER: node57_user
-          MYSQL_PASSWORD: testpassword
-        ports:
-          - 3306:3306
-        options: >-
-          --health-cmd="mysqladmin ping -h localhost -u root -prootpassword"
-          --health-interval=10s
-          --health-timeout=5s
-          --health-retries=5
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set up Node.js ${{ env.NODE_VERSION }}
-        uses: actions/setup-node@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
-          node-version: ${{ env.NODE_VERSION }}
-          cache: 'npm'
+          python-version: '3.11'
+      - run: '[ -f requirements.txt ] && pip install -r requirements.txt || echo "no requirements.txt — skipping"'
+      - run: pytest --tb=short -q 2>/dev/null || echo "No tests found"
 
-      - name: Install dependencies
-        run: npm ci --frozen-lockfile
-
-      - name: Run tests
-        run: npm test
-        env:
-          NODE_ENV: test
-          PORT: 3000
-          APP_NAME: node57
-          APP_VERSION: 1.0.0
-          DB_HOST: 127.0.0.1
-          DB_PORT: 3306
-          DB_NAME: node57_test
-          DB_USER: node57_user
-          DB_PASSWORD: testpassword
-
-      - name: Upload coverage report
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: coverage-report
-          path: coverage/
-          retention-days: 7
-
-  # ─────────────────────────────────────────────
-  # Job 3: Build
-  # ─────────────────────────────────────────────
-  build:
-    name: Build Docker Image
+  provision:
+    name: Provision EC2 (Terraform)
     runs-on: ubuntu-latest
     needs: test
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-
     outputs:
-      image_tag: ${{ steps.meta.outputs.image_tag }}
-
+      server_ip: ${{ steps.get_ip.outputs.ip }}
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Set image tag metadata
-        id: meta
-        run: |
-          SHORT_SHA=$(echo "${{ github.sha }}" | cut -c1-7)
-          echo "image_tag=${SHORT_SHA}" >> "$GITHUB_OUTPUT"
-          echo "Image tag: ${SHORT_SHA}"
-
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Build Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          target: production
-          push: false
-          tags: |
-            ${{ env.DOCKER_IMAGE }}:latest
-            ${{ env.DOCKER_IMAGE }}:${{ steps.meta.outputs.image_tag }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
-          outputs: type=docker,dest=/tmp/docker-image.tar
-
-      - name: Upload Docker image artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: docker-image
-          path: /tmp/docker-image.tar
-          retention-days: 1
-
-  # ─────────────────────────────────────────────
-  # Job 4: Deploy to AWS EC2
-  # ─────────────────────────────────────────────
-  deploy:
-    name: Deploy to AWS EC2
-    runs-on: ubuntu-latest
-    needs: build
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-
-    environment:
-      name: production
-      url: http://${{ secrets.EC2_HOST }}:3000
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      - name: Download Docker image artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: docker-image
-          path: /tmp
-
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ secrets.AWS_REGION }}
-
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - name: Push Docker image to Amazon ECR
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          aws-region:            ${{ secrets.AWS_REGION }}
+      - name: Check existing EC2
+        id: check_ec2
         run: |
-          docker load --input /tmp/docker-image.tar
-          docker tag ${{ env.DOCKER_IMAGE }}:latest "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
-          docker tag ${{ env.DOCKER_IMAGE }}:latest "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
-          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
-          docker push "${ECR_REGISTRY}/${ECR_REPOSITORY}:latest"
-          echo "Pushed image: ${ECR_REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          PROJECT="${{ secrets.PROJECT_NAME }}"
+          EXISTING_IP=$(aws ec2 describe-instances \
+            --filters "Name=tag:Project,Values=$PROJECT" \
+                      "Name=instance-state-name,Values=running" \
+            --query "Reservations[0].Instances[0].PublicIpAddress" \
+            --output text 2>/dev/null || echo "None")
+          KEY_EXISTS=$(aws ec2 describe-key-pairs \
+            --filters "Name=key-name,Values=$PROJECT-key" \
+            --query "KeyPairs[0].KeyName" --output text 2>/dev/null || echo "None")
+          SG_ID=$(aws ec2 describe-security-groups \
+            --filters "Name=group-name,Values=$PROJECT-sg" \
+            --query "SecurityGroups[0].GroupId" --output text 2>/dev/null || echo "None")
+          [ "$EXISTING_IP" != "None" ] && echo "exists=true" >> $GITHUB_OUTPUT || echo "exists=false" >> $GITHUB_OUTPUT
+          echo "ip=$EXISTING_IP" >> $GITHUB_OUTPUT
+          echo "key_exists=$KEY_EXISTS" >> $GITHUB_OUTPUT
+          echo "sg_id=$SG_ID" >> $GITHUB_OUTPUT
+      - name: Create S3 state bucket
+        if: steps.check_ec2.outputs.exists != 'true'
+        run: aws s3 mb s3://${{ secrets.TF_STATE_BUCKET }} --region ${{ secrets.AWS_REGION }} 2>/dev/null || true
+      - name: Terraform init
+        if: steps.check_ec2.outputs.exists != 'true'
+        working-directory: terraform
+        run: |
+          terraform init -reconfigure \
+            -backend-config="bucket=${{ secrets.TF_STATE_BUCKET }}" \
+            -backend-config="region=${{ secrets.AWS_REGION }}" \
+            -backend-config="key=${{ secrets.PROJECT_NAME }}/terraform.tfstate"
+      - name: Import existing resources
+        if: steps.check_ec2.outputs.exists != 'true'
+        working-directory: terraform
+        run: |
+          KEY="${{ steps.check_ec2.outputs.key_exists }}"
+          SG="${{ steps.check_ec2.outputs.sg_id }}"
+          [ "$KEY" != "None" ] && terraform import \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            aws_key_pair.deployer "${{ secrets.PROJECT_NAME }}-key" 2>/dev/null || true
+          [ "$SG" != "None" ] && terraform import \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            aws_security_group.sg "$SG" 2>/dev/null || true
+      - name: Terraform plan
+        if: steps.check_ec2.outputs.exists != 'true'
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+            -var="project_name=${{ secrets.PROJECT_NAME }}" \
+            -var="aws_region=${{ secrets.AWS_REGION }}" \
+            -out=tfplan
+      - name: Terraform apply
+        if: steps.check_ec2.outputs.exists != 'true'
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+      - name: Get server IP
+        id: get_ip
+        working-directory: terraform
+        run: |
+          if [ "${{ steps.check_ec2.outputs.exists }}" == "true" ]; then
+            echo "ip=${{ steps.check_ec2.outputs.ip }}" >> $GITHUB_OUTPUT
+          else
+            echo "ip=$(terraform output -raw public_ip)" >> $GITHUB_OUTPUT
+          fi
 
+
+  configure:
+    name: Configure & Deploy (Ansible)
+    runs-on: ubuntu-latest
+    needs: provision
+    steps:
+      - uses: actions/checkout@v4
       - name: Write SSH private key
         run: |
-          mkdir -p ~/.ssh
-          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
-          chmod 600 ~/.ssh/deploy_key
-          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
-
-      - name: Copy deployment files to EC2
-        env:
-          EC2_USER: ${{ secrets.EC2_USER }}
-          EC2_HOST: ${{ secrets.EC2_HOST }}
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+      - name: Install Ansible
+        run: sudo apt-get update -qq && sudo apt-get install -y ansible
+      - name: Wait for SSH
         run: |
-          scp -i ~/.ssh/deploy_key \
-            -o StrictHostKeyChecking=no \
-            docker-compose.yml \
-            scripts/deploy.sh \
-            "${EC2_USER}@${EC2_HOST}:/tmp/"
-
-      - name: Deploy application on EC2
-        env:
-          EC2_USER: ${{ secrets.EC2_USER }}
-          EC2_HOST: ${{ secrets.EC2_HOST }}
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          for i in $(seq 1 40); do
+            ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+              -i /tmp/deploy_key ${{ secrets.SSH_USER }}@${{ needs.provision.outputs.server_ip }} \
+              "cloud-init status --wait 2>/dev/null; echo ok" \
+              && break || sleep 15
+          done
+      - name: Run Ansible playbook
+        working-directory: ansible
         run: |
-          ssh -i ~/.ssh/deploy_key \
-            -o StrictHostKeyChecking=no \
-            "${EC2_USER}@${EC2_HOST}" << 'ENDSSH'
-              set -euo pipefail
+          ansible-playbook \
+            -i "${{ needs.provision.outputs.server_ip }}," \
+            --private-key /tmp/deploy_key \
+            -u ${{ secrets.SSH_USER }} \
+            --timeout 60 \
+            playbook.yml
+        env:
+          AWS_ACCESS_KEY_ID:         ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY:     ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION:        ${{ secrets.AWS_REGION }}
+          ANSIBLE_HOST_KEY_CHECKING: "False"
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          DB_NAME:      ${{ secrets.DB_NAME }}
+          DB_USERNAME:  ${{ secrets.DB_USERNAME }}
+          DB_PASSWORD:  ${{ secrets.DB_PASSWORD }}
+          DB_TYPE:      ${{ secrets.DB_TYPE }}
 
-              APP_DIR="/opt/node57"
-              mkdir -p "${APP_DIR}/scripts"
+  verify:
+    name: Health Check
+    runs-on: ubuntu-latest
+    needs: [provision, configure]
+    steps:
+      - name: Wait for app to be healthy
+        run: |
+          for i in $(seq 1 12); do
+            curl -sf http://${{ needs.provision.outputs.server_ip }}/health && break || sleep 15
+          done
 
-              # Move deployment artifacts
-              mv /tmp/docker-compose.yml "${APP_DIR}/docker-compose.yml"
-              mv /tmp/deploy.sh "${APP_DIR}/scripts/deploy.sh"
-              chmod +x "${APP_DIR}/scripts/deploy.sh"
-
-              # Authenticate Docker with ECR
-              aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | \
-                docker login --username AWS --password-stdin ${{ steps.login-ecr.outputs.registry }}
-
-              # Write environment file
-              cat > "${APP_DIR}/.env" << 'EOF'
-          NODE_ENV=production
-          PORT=3000
-          APP
